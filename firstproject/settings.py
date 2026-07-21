@@ -96,9 +96,10 @@ REST_FRAMEWORK = {
     ),
 }
 
-SIMPLE_JWT = {
+SIMPLE_JWT = { 
     'ACCESS_TOKEN_LIFETIME': timedelta(hours=12),
 }
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
