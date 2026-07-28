@@ -7,7 +7,16 @@ from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-from .email_config import *  # noqa: F401,F403
+# Optional. If email_config.py is gitignored (common, since it holds mail
+# credentials) it will not exist in the Railway container. A hard import there
+# crashes the whole API at startup, which is a heavy price for a missing
+# mailer. Import defensively and let email fail on its own terms instead.
+try:
+    from .email_config import *  # noqa: F401,F403
+except ImportError:
+    EMAIL_CONFIG_LOADED = False
+else:
+    EMAIL_CONFIG_LOADED = True
 
 # ---------------------------------------------------------------------------
 # Core
@@ -19,9 +28,11 @@ RAILWAY_HOST = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
 IS_RAILWAY = bool(RAILWAY_HOST or os.environ.get("RAILWAY_ENVIRONMENT"))
 
 # An explicit DEBUG env var always wins. Otherwise: off on Railway, on
-# locally. Previously DEBUG defaulted to False everywhere, which meant your
-# dev server was running in production mode without you realising, and
-# static() silently served nothing locally either.
+# locally. Note that because IS_RAILWAY already forces False in production,
+# you do not need a DEBUG variable set on Railway at all. If one is set and
+# its value is not exactly "False", it is silently ignored here, but any
+# value of exactly "True" WILL turn debug on in production. Safest to delete
+# the variable from the Railway dashboard entirely.
 DEBUG = os.environ.get("DEBUG", "False" if IS_RAILWAY else "True") == "True"
 
 # Required in production, with a throwaway fallback for local runs so you are
@@ -52,7 +63,21 @@ CSRF_TRUSTED_ORIGINS = ["https://*.railway.app"]
 if RAILWAY_HOST:
     CSRF_TRUSTED_ORIGINS.append(f"https://{RAILWAY_HOST}")
 
+# Railway terminates TLS at its edge and forwards plain HTTP to the
+# container, so Django needs this header to know the original request was
+# secure. Without it, request.is_secure() is always False and secure cookies
+# are never sent.
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# Cookie hardening, production only. Left off in DEBUG so the local dev
+# server over plain HTTP still works.
+if not DEBUG:
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
+# Deliberately NOT setting SECURE_SSL_REDIRECT. Railway already redirects
+# HTTP to HTTPS at the edge, and enabling it here can produce a redirect
+# loop if the proxy header is ever misread.
 
 # ---------------------------------------------------------------------------
 # Media storage
@@ -102,8 +127,12 @@ if USE_CLOUDINARY:
     }
 
 # Django 6 removed DEFAULT_FILE_STORAGE and STATICFILES_STORAGE. Both are
-# configured through STORAGES now. Your old STATICFILES_STORAGE line was
-# being ignored, so WhiteNoise was running without compressed manifests.
+# configured through STORAGES now.
+#
+# The staticfiles backend is gated on DEBUG. CompressedManifestStaticFilesStorage
+# requires a staticfiles.json manifest that only exists after collectstatic has
+# run, so applying it locally makes {% static %} raise
+# "Missing staticfiles manifest entry" on a fresh checkout.
 STORAGES = {
     "default": {
         "BACKEND": (
@@ -113,7 +142,11 @@ STORAGES = {
         ),
     },
     "staticfiles": {
-        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+        "BACKEND": (
+            "django.contrib.staticfiles.storage.StaticFilesStorage"
+            if DEBUG
+            else "whitenoise.storage.CompressedManifestStaticFilesStorage"
+        ),
     },
 }
 
@@ -163,15 +196,22 @@ WSGI_APPLICATION = "firstproject.wsgi.application"
 
 # ---------------------------------------------------------------------------
 # Database
+#
+# ssl_require is now conditional. Railway's own Postgres is reached over the
+# private network at *.railway.internal, which does NOT speak TLS: forcing
+# sslmode=require against it fails to connect. External managed databases
+# (Neon, Supabase, RDS) do require it. Detecting the internal hostname keeps
+# both cases working without a manual edit.
 # ---------------------------------------------------------------------------
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL:
+    IS_INTERNAL_DB = ".railway.internal" in DATABASE_URL
     DATABASES = {
         "default": dj_database_url.config(
             default=DATABASE_URL,
             conn_max_age=600,
-            ssl_require=True,
+            ssl_require=not IS_INTERNAL_DB,
         )
     }
 else:
@@ -220,4 +260,52 @@ USE_TZ = True
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
+# WhiteNoise refuses to start if STATIC_ROOT does not exist. It is created by
+# collectstatic, but this makes a fresh checkout safe before that first run.
+STATIC_ROOT.mkdir(parents=True, exist_ok=True)
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {
+        "console": {"class": "logging.StreamHandler"},
+    },
+    "root": {"handlers": ["console"], "level": "INFO"},
+    "loggers": {
+        "django.request": {
+            "handlers": ["console"],
+            "level": "ERROR",
+            "propagate": False,
+        },
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Startup diagnostics
+#
+# One line in the Railway deploy log telling you which branch of every
+# conditional above was taken. Cheap, and it turns "why is this behaving
+# differently in production" into a five second check.
+#
+# Deliberately a print rather than a logger call. The LOGGING dict above is
+# only applied by Django during django.setup(), which happens AFTER this
+# module finishes importing. A logger.info() here would be evaluated against
+# Python's default root level of WARNING and silently discarded. Gunicorn
+# forwards stdout straight to Railway's deploy logs, so print lands where it
+# is wanted.
+# ---------------------------------------------------------------------------
+
+if IS_RAILWAY:
+    print(
+        f"CRAFTD boot: debug={DEBUG} host={RAILWAY_HOST or 'unset'} "
+        f"cloudinary={USE_CLOUDINARY} "
+        f"db={'postgres' if DATABASE_URL else 'sqlite'} "
+        f"email_config={EMAIL_CONFIG_LOADED}",
+        flush=True,
+    )
