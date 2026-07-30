@@ -33,12 +33,17 @@ IS_RAILWAY = bool(RAILWAY_HOST or os.environ.get("RAILWAY_ENVIRONMENT"))
 # its value is not exactly "False", it is silently ignored here, but any
 # value of exactly "True" WILL turn debug on in production. Safest to delete
 # the variable from the Railway dashboard entirely.
-DEBUG = os.environ.get("DEBUG", "False" if IS_RAILWAY else "True") == "True"
+DEBUG = os.environ.get("DEBUG", "False" if IS_RAILWAY else "True").strip() == "True"
 
 # Required in production, with a throwaway fallback for local runs so you are
 # not forced to set an env var just to start the dev server. The fallback is
 # unreachable when DEBUG is False, so production still fails loudly.
-SECRET_KEY = os.environ.get("SECRET_KEY")
+#
+# .strip() throughout: copying a value out of a web dashboard very easily
+# picks up a leading tab or trailing newline. The variable then looks correct
+# in the UI (the whitespace is invisible) but the service rejects it, which
+# is an expensive hour to debug. Stripping costs nothing and rules it out.
+SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
 if not SECRET_KEY:
     if DEBUG:
         SECRET_KEY = "django-insecure-local-development-only"
@@ -91,9 +96,9 @@ if not DEBUG:
 # local development keeps working unchanged.
 # ---------------------------------------------------------------------------
 
-CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
-CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY")
-CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "").strip()
+CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
 
 USE_CLOUDINARY = all(
     [CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]
@@ -204,7 +209,7 @@ WSGI_APPLICATION = "firstproject.wsgi.application"
 # both cases working without a manual edit.
 # ---------------------------------------------------------------------------
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 if DATABASE_URL:
     IS_INTERNAL_DB = ".railway.internal" in DATABASE_URL
     DATABASES = {
@@ -305,6 +310,10 @@ if IS_RAILWAY:
     print(
         f"CRAFTD boot: debug={DEBUG} host={RAILWAY_HOST or 'unset'} "
         f"cloudinary={USE_CLOUDINARY} "
+        f"cloud_name={CLOUDINARY_CLOUD_NAME or 'unset'} "
+        f"key_len={len(CLOUDINARY_API_KEY)} "
+        f"key_numeric={CLOUDINARY_API_KEY.isdigit()} "
+        f"secret_len={len(CLOUDINARY_API_SECRET)} "
         f"db={'postgres' if DATABASE_URL else 'sqlite'} "
         f"email_config={EMAIL_CONFIG_LOADED}",
         flush=True,
