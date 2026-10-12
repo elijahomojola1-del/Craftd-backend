@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets: mail credentials are set as environment variables in production
+firstproject/email_config.py
+.env
+.env.*
+
+# Local
+staticfiles/

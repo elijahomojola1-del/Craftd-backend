@@ -18,6 +18,24 @@ except ImportError:
 else:
     EMAIL_CONFIG_LOADED = True
 
+# In production the mail credentials come from environment variables, so the
+# password never has to live in the repository. They win over email_config.py.
+if os.environ.get("EMAIL_HOST_PASSWORD", "").strip():
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    EMAIL_HOST = os.environ.get("EMAIL_HOST", "smtp.gmail.com").strip()
+    EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465").strip())
+    EMAIL_USE_SSL = os.environ.get("EMAIL_USE_SSL", "True").strip() == "True"
+    EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "False").strip() == "True"
+    EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "").strip()
+    EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "").strip()
+    DEFAULT_FROM_EMAIL = os.environ.get(
+        "DEFAULT_FROM_EMAIL", f"CRAFTD <{EMAIL_HOST_USER}>"
+    ).strip()
+    EMAIL_CONFIG_LOADED = True
+
+# Never let a slow or blocked mail server hang a request.
+EMAIL_TIMEOUT = 10
+
 # ---------------------------------------------------------------------------
 # Core
 # ---------------------------------------------------------------------------
