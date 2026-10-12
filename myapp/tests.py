@@ -205,3 +205,40 @@ class SafetyTests(APITestCase):
         self.assertTrue(self.client.get(f"/app/conversations/{convo['id']}/messages/").data[0]['is_mine'])
         self.client.force_authenticate(self.provider)
         self.assertFalse(self.client.get(f"/app/conversations/{convo['id']}/messages/").data[0]['is_mine'])
+
+    def test_ratings_and_counts_follow_reviews(self):
+        booking = Booking.objects.create(
+            client=self.client_user, provider=self.provider, gig=self.gig, status='completed',
+        )
+
+        def snapshot():
+            self.client.force_authenticate(self.provider)
+            stats = self.client.get('/app/provider-stats/').data
+            self.client.force_authenticate(self.client_user)
+            page = self.client.get(f'/app/provider/{self.provider.id}/').data
+            gig = self.client.get('/app/gigs/').data[0]
+            return (stats['reviews'], page['total_reviews'], page['average_rating'],
+                    gig['provider_review_count'], gig['provider_rating'])
+
+        self.assertEqual(snapshot(), (0, 0, 0, 0, None))
+
+        self.client.force_authenticate(self.client_user)
+        created = self.client.post(f'/app/bookings/{booking.id}/reviews/', {'rating': 4, 'comment': 'Good work'})
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(snapshot(), (1, 1, 4.0, 1, 4.0))
+
+        # A second completed job, reviewed with 5 stars, moves the average.
+        second = Booking.objects.create(
+            client=self.client_user, provider=self.provider, gig=self.gig, status='completed',
+        )
+        self.client.force_authenticate(self.client_user)
+        self.client.post(f'/app/bookings/{second.id}/reviews/', {'rating': 5})
+        self.assertEqual(snapshot(), (2, 2, 4.5, 2, 4.5))
+
+        # Deleting a review takes it back out of the numbers.
+        self.client.force_authenticate(self.client_user)
+        self.assertEqual(self.client.delete(f"/app/reviews/{created.data['id']}/").status_code, 204)
+        self.assertEqual(snapshot(), (1, 1, 5.0, 1, 5.0))
+
+        out_of_range = self.client.post(f'/app/bookings/{booking.id}/reviews/', {'rating': 9})
+        self.assertEqual(out_of_range.status_code, 400)
