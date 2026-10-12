@@ -38,6 +38,7 @@ from .serializers import (
 )
 from .push_notifications import send_push_notification, send_sms
 from .subscriptions import LockState
+from . import payments
 
 User = get_user_model()
 
@@ -683,11 +684,13 @@ class SubscriptionView(generics.GenericAPIView):
 
     def get(self, request):
         data = LockState(request.user).summary()
-        try:
-            data['expires'] = request.user.profile.subscription_expires
-        except Profile.DoesNotExist:
-            data['expires'] = None
-        data['price_text'] = AppSettings.load().subscription_price_text
+        data['expires'] = (
+            Profile.objects.filter(user=request.user).values_list('subscription_expires', flat=True).first()
+        )
+        data['price_text'] = payments.price_text()
+        # False until a Paystack key and a price are set; the app then falls
+        # back to "request a subscription".
+        data['payment_available'] = payments.payment_available()
         data['requested'] = SubscriptionRequest.objects.filter(user=request.user, handled=False).exists()
         return Response(data)
 
@@ -701,3 +704,54 @@ class SubscriptionRequestView(generics.GenericAPIView):
     def post(self, request):
         SubscriptionRequest.objects.get_or_create(user=request.user, handled=False)
         return Response({'detail': "Thanks. We have your request and will be in touch to set up your subscription."})
+
+
+# ---------------------------------------------------------------------------
+# Paying for a subscription (Paystack)
+# ---------------------------------------------------------------------------
+
+class SubscriptionPayView(generics.GenericAPIView):
+    """Starts a payment and returns the Paystack checkout address to open."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        try:
+            return Response(payments.start_payment(request.user))
+        except payments.PaymentError as exc:
+            return Response({'detail': str(exc)}, status=503)
+
+
+class SubscriptionVerifyView(generics.GenericAPIView):
+    """Called when the user comes back from the checkout page."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        reference = (request.data.get('reference') or '').strip()
+        if not reference:
+            return Response({'detail': 'reference is required.'}, status=400)
+        try:
+            payment = payments.verify_payment(request.user, reference)
+        except payments.PaymentError as exc:
+            return Response({'detail': str(exc)}, status=400)
+        return Response({'status': payment.status})
+
+
+class PaystackWebhookView(generics.GenericAPIView):
+    """Paystack calls this itself when a payment succeeds, so a subscription
+    still switches on if the user closes the page before returning."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        signature = request.headers.get('x-paystack-signature', '')
+        if not payments.valid_signature(request.body, signature):
+            return Response(status=401)
+
+        event = request.data.get('event')
+        data = request.data.get('data') or {}
+        if event == 'charge.success' and data.get('reference'):
+            payments.apply_payment(data['reference'], data.get('amount', 0), data.get('currency', 'NGN'))
+        return Response(status=200)

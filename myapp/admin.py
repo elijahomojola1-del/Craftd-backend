@@ -1,6 +1,6 @@
 from django.contrib import admin
 from .models import (
-    AppSettings, Block, Booking, Gig, Profile, PortfolioImage, Report, Review,
+    AppSettings, Block, Booking, Gig, Payment, Profile, PortfolioImage, Report, Review,
     SubscriptionRequest,
 )
 
@@ -37,7 +37,7 @@ class SubscriptionRequestAdmin(admin.ModelAdmin):
 
 @admin.register(AppSettings)
 class AppSettingsAdmin(admin.ModelAdmin):
-    list_display = ('__str__', 'free_provider_bookings', 'free_client_bookings', 'subscription_price_text')
+    list_display = ('__str__', 'free_provider_bookings', 'free_client_bookings', 'subscription_price_naira', 'subscription_days')
 
     def has_add_permission(self, request):
         # There is only ever one row of settings.
@@ -45,3 +45,11 @@ class AppSettingsAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+@admin.register(Payment)
+class PaymentAdmin(admin.ModelAdmin):
+    list_display = ('user', 'reference', 'amount_kobo', 'days', 'status', 'created_at', 'paid_at')
+    list_filter = ('status',)
+    search_fields = ('user__username', 'user__email', 'reference')
+    readonly_fields = ('user', 'reference', 'amount_kobo', 'days', 'status', 'created_at', 'paid_at')

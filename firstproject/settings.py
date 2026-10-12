@@ -36,6 +36,12 @@ if os.environ.get("EMAIL_HOST_PASSWORD", "").strip():
 # Never let a slow or blocked mail server hang a request.
 EMAIL_TIMEOUT = 10
 
+# Paystack. The secret key is only ever read from the environment; while it
+# is unset the app offers "request a subscription" instead of online payment.
+PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "").strip()
+# Where Paystack sends the user back to after paying.
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://craftd-1.expo.app").strip()
+
 # ---------------------------------------------------------------------------
 # Core
 # ---------------------------------------------------------------------------

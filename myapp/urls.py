@@ -33,4 +33,7 @@ urlpatterns = [
     path('blocks/<int:user_id>/', views.BlockDeleteView.as_view(), name='block-delete'),
     path('subscription/', views.SubscriptionView.as_view(), name='subscription'),
     path('subscription/request/', views.SubscriptionRequestView.as_view(), name='subscription-request'),
+    path('subscription/pay/', views.SubscriptionPayView.as_view(), name='subscription-pay'),
+    path('subscription/verify/', views.SubscriptionVerifyView.as_view(), name='subscription-verify'),
+    path('paystack/webhook/', views.PaystackWebhookView.as_view(), name='paystack-webhook'),
 ]

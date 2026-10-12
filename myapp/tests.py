@@ -356,3 +356,110 @@ class SubscriptionTests(APITestCase):
         self.assertEqual(self.accept(ids[0]).status_code, 200)
         self.assertEqual(self.accept(ids[1]).status_code, 402)
         self.assertEqual(AppSettings.objects.count(), 1)
+
+
+class PaymentTests(APITestCase):
+    """Paystack is faked here; no real request leaves the test."""
+
+    def setUp(self):
+        from unittest import mock
+        from django.test import override_settings
+        from .models import AppSettings
+
+        self.user = make_user('payer@example.com', name='Payer')
+        config = AppSettings.load()
+        config.subscription_price_naira = 2000
+        config.subscription_days = 30
+        config.save()
+
+        override = override_settings(PAYSTACK_SECRET_KEY='sk_test_fake', FRONTEND_URL='https://example.test')
+        override.enable()
+        self.addCleanup(override.disable)
+
+        patcher = mock.patch('myapp.payments.requests.request')
+        self.paystack = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def reply(self, data, ok=True):
+        from unittest import mock
+        response = mock.Mock()
+        response.json.return_value = {'status': ok, 'message': 'msg', 'data': data}
+        self.paystack.return_value = response
+
+    def start(self):
+        self.reply({'authorization_url': 'https://checkout.paystack.com/abc', 'access_code': 'abc', 'reference': 'ignored'})
+        self.client.force_authenticate(self.user)
+        res = self.client.post('/app/subscription/pay/')
+        self.assertEqual(res.status_code, 200, res.data)
+        return res.data['reference']
+
+    def test_pay_asks_paystack_for_the_right_amount(self):
+        from .models import Payment
+        reference = self.start()
+        sent = self.paystack.call_args.kwargs['json']
+        self.assertEqual((sent['amount'], sent['currency'], sent['email']), (200000, 'NGN', 'payer@example.com'))
+        self.assertEqual(sent['callback_url'], 'https://example.test/subscribe')
+        self.assertEqual(self.paystack.call_args.kwargs['headers']['Authorization'], 'Bearer sk_test_fake')
+        self.assertEqual(Payment.objects.get().reference, reference)
+        self.assertEqual(self.client.get('/app/subscription/').data['price_text'], '\u20a62,000 for 30 days')
+
+    def test_verify_switches_subscription_on_once(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        reference = self.start()
+
+        self.reply({'status': 'success', 'amount': 200000, 'currency': 'NGN'})
+        self.assertEqual(self.client.post('/app/subscription/verify/', {'reference': reference}).data['status'], 'success')
+        profile = Profile.objects.get(user=self.user)
+        self.assertTrue(profile.is_subscribed)
+        first_expiry = profile.subscription_expires
+        self.assertAlmostEqual(first_expiry, timezone.now() + timedelta(days=30), delta=timedelta(minutes=1))
+
+        # Verifying the same payment again must not add another month.
+        self.client.post('/app/subscription/verify/', {'reference': reference})
+        self.assertEqual(Profile.objects.get(user=self.user).subscription_expires, first_expiry)
+        self.assertTrue(self.client.get('/app/subscription/').data['is_subscribed'])
+
+        # A second, separate payment extends from the current end date.
+        second = self.start()
+        self.reply({'status': 'success', 'amount': 200000, 'currency': 'NGN'})
+        self.client.post('/app/subscription/verify/', {'reference': second})
+        self.assertEqual(Profile.objects.get(user=self.user).subscription_expires, first_expiry + timedelta(days=30))
+
+    def test_underpayment_and_failed_payment_do_not_subscribe(self):
+        reference = self.start()
+        self.reply({'status': 'success', 'amount': 100, 'currency': 'NGN'})
+        self.assertEqual(self.client.post('/app/subscription/verify/', {'reference': reference}).data['status'], 'failed')
+
+        reference = self.start()
+        self.reply({'status': 'abandoned', 'amount': 0})
+        self.assertEqual(self.client.post('/app/subscription/verify/', {'reference': reference}).data['status'], 'failed')
+        self.assertFalse(Profile.objects.get(user=self.user).is_subscribed)
+
+    def test_cannot_verify_someone_elses_payment(self):
+        reference = self.start()
+        other = make_user('other@example.com')
+        self.client.force_authenticate(other)
+        self.assertEqual(self.client.post('/app/subscription/verify/', {'reference': reference}).status_code, 400)
+
+    def test_webhook_needs_a_valid_signature(self):
+        import hashlib, hmac, json
+        reference = self.start()
+        self.client.force_authenticate(None)
+        body = json.dumps({'event': 'charge.success', 'data': {'reference': reference, 'amount': 200000, 'currency': 'NGN'}})
+
+        forged = self.client.post('/app/paystack/webhook/', body, content_type='application/json', HTTP_X_PAYSTACK_SIGNATURE='nope')
+        self.assertEqual(forged.status_code, 401)
+        self.assertFalse(Profile.objects.get(user=self.user).is_subscribed)
+
+        signature = hmac.new(b'sk_test_fake', body.encode(), hashlib.sha512).hexdigest()
+        real = self.client.post('/app/paystack/webhook/', body, content_type='application/json', HTTP_X_PAYSTACK_SIGNATURE=signature)
+        self.assertEqual(real.status_code, 200)
+        self.assertTrue(Profile.objects.get(user=self.user).is_subscribed)
+
+    def test_payment_off_without_key_or_price(self):
+        from django.test import override_settings
+        with override_settings(PAYSTACK_SECRET_KEY=''):
+            self.client.force_authenticate(self.user)
+            self.assertFalse(self.client.get('/app/subscription/').data['payment_available'])
+            self.assertEqual(self.client.post('/app/subscription/pay/').status_code, 503)

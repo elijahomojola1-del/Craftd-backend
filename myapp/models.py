@@ -259,9 +259,17 @@ class AppSettings(models.Model):
         default=5,
         help_text="How many accepted bookings a client can open before needing a subscription.",
     )
+    subscription_price_naira = models.PositiveIntegerField(
+        default=0,
+        help_text="What one subscription period costs, in naira. Online payment stays off while this is 0.",
+    )
+    subscription_days = models.PositiveIntegerField(
+        default=30,
+        help_text="How many days one payment buys.",
+    )
     subscription_price_text = models.CharField(
         max_length=80, blank=True,
-        help_text='Shown on the Subscribe screen, e.g. "N2,000 a month". Leave empty to hide.',
+        help_text='Optional wording for the Subscribe screen. Leave empty to show the price and days above.',
     )
 
     class Meta:
@@ -296,3 +304,29 @@ class SubscriptionRequest(models.Model):
 
     def __str__(self):
         return f"{self.user.username} wants to subscribe"
+
+
+class Payment(models.Model):
+    """One attempt to pay for a subscription through Paystack."""
+
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('success', 'Success'),
+        ('failed', 'Failed'),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='payments'
+    )
+    reference = models.CharField(max_length=64, unique=True)
+    amount_kobo = models.PositiveIntegerField()
+    days = models.PositiveIntegerField()
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+    paid_at = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user.username} {self.reference} ({self.status})"
