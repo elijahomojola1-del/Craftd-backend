@@ -63,6 +63,10 @@ class Profile(models.Model):
     # Shown to other users in place of the account's email address.
     display_name = models.CharField(max_length=80, blank=True)
     role = models.CharField(max_length=10, choices=ROLE_CHOICES, default='provider')
+    # Switched on by an admin (or by payment, once connected). An empty
+    # expiry date means the subscription does not run out.
+    is_subscribed = models.BooleanField(default=False)
+    subscription_expires = models.DateTimeField(blank=True, null=True)
     bio = models.TextField(max_length=500, blank=True)
     location = models.CharField(max_length=120, blank=True)
     phone_number = models.CharField(max_length=20, blank=True)
@@ -242,3 +246,53 @@ class PasswordResetCode(models.Model):
 
     def __str__(self):
         return f"Password reset for {self.user.username}"
+
+
+class AppSettings(models.Model):
+    """One row of business settings, editable in the admin without new code."""
+
+    free_provider_bookings = models.PositiveIntegerField(
+        default=3,
+        help_text="How many bookings a provider can accept before needing a subscription.",
+    )
+    free_client_bookings = models.PositiveIntegerField(
+        default=5,
+        help_text="How many accepted bookings a client can open before needing a subscription.",
+    )
+    subscription_price_text = models.CharField(
+        max_length=80, blank=True,
+        help_text='Shown on the Subscribe screen, e.g. "N2,000 a month". Leave empty to hide.',
+    )
+
+    class Meta:
+        verbose_name = "App settings"
+        verbose_name_plural = "App settings"
+
+    def __str__(self):
+        return "App settings"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1  # only ever one row
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+class SubscriptionRequest(models.Model):
+    """Someone tapped "Subscribe". Until online payment exists, an admin
+    follows up and switches the subscription on from the Profile page."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='subscription_requests'
+    )
+    handled = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user.username} wants to subscribe"

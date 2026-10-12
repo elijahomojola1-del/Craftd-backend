@@ -8,6 +8,7 @@ from .models import (
     Block, Booking, Conversation, Gig, Message, PortfolioImage, Profile, Report,
     Review, ROLE_CHOICES, public_name,
 )
+from .subscriptions import lock_state_for
 
 
 def check_password_strength(password, user=None):
@@ -97,10 +98,12 @@ class ProfileSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'username', 'display_name', 'role', 'email', 'bio', 'location',
             'phone_number', 'profile_picture', 'is_verified', 'gig_count',
+            'is_subscribed', 'subscription_expires',
             'latitude', 'longitude', 'city', 'state',
             'created_at', 'updated_at'
         ]
-        read_only_fields = ['is_verified']
+        # Users can't verify or subscribe themselves by editing their profile.
+        read_only_fields = ['is_verified', 'is_subscribed', 'subscription_expires']
 
     def get_gig_count(self, obj):
         return obj.user.gigs.count()
@@ -148,6 +151,22 @@ class BookingSerializer(serializers.ModelSerializer):
 
     def get_provider_phone(self, obj):
         return self._phone_once_accepted(obj, obj.provider)
+
+    def to_representation(self, obj):
+        data = super().to_representation(obj)
+
+        # A locked booking is one the viewer has to subscribe to open: the
+        # other person's details are withheld here, not just hidden on screen.
+        state = lock_state_for(self.context)
+        locked = bool(state and state.is_locked(obj))
+        data['locked'] = locked
+        if locked:
+            data['client_phone'] = None
+            data['provider_phone'] = None
+            if obj.provider_id == state.user.id:
+                data['client_username'] = 'A client'
+                data['message'] = ''
+        return data
 
     def get_review_id(self, obj):
         request = self.context.get('request')

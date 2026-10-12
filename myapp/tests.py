@@ -242,3 +242,117 @@ class SafetyTests(APITestCase):
 
         out_of_range = self.client.post(f'/app/bookings/{booking.id}/reviews/', {'rating': 9})
         self.assertEqual(out_of_range.status_code, 400)
+
+
+class SubscriptionTests(APITestCase):
+    """Free allowance: providers get 3 accepted bookings, clients get 5."""
+
+    def setUp(self):
+        self.provider = make_user('provider@example.com', name='Provider')
+        Profile.objects.filter(user=self.provider).update(phone_number='08011112222')
+        self.gig = Gig.objects.create(provider=self.provider, title='Painting', description='Walls', category='home_repairs')
+        self.clients = [make_user(f'client{n}@example.com', name=f'Client {n}', role='client') for n in range(5)]
+
+    def request_booking(self, client, gig=None):
+        self.client.force_authenticate(client)
+        res = self.client.post('/app/bookings/', {
+            'gig': (gig or self.gig).id, 'proposed_date': '2030-01-01T12:00:00', 'message': 'Secret details',
+        })
+        self.assertEqual(res.status_code, 201, res.data)
+        return res.data['id']
+
+    def accept(self, booking_id, as_user=None):
+        self.client.force_authenticate(as_user or self.provider)
+        return self.client.patch(f'/app/bookings/{booking_id}/status/', {'status': 'accepted'})
+
+    def received(self):
+        self.client.force_authenticate(self.provider)
+        return {b['id']: b for b in self.client.get('/app/bookings/received/').data}
+
+    def test_provider_gets_three_free_then_requests_lock(self):
+        ids = [self.request_booking(c) for c in self.clients[:4]]
+        for booking_id in ids[:3]:
+            self.assertEqual(self.accept(booking_id).status_code, 200)
+
+        self.client.force_authenticate(self.provider)
+        summary = self.client.get('/app/subscription/').data
+        self.assertEqual(summary['provider'], {'free_limit': 3, 'used': 3, 'remaining': 0})
+        self.assertFalse(summary['is_subscribed'])
+
+        fourth = self.received()[ids[3]]
+        self.assertTrue(fourth['locked'])
+        self.assertEqual((fourth['client_username'], fourth['message'], fourth['client_phone']), ('A client', '', None))
+        # Still enough to tempt: which skill and when.
+        self.assertEqual(fourth['gig_title'], 'Painting')
+        self.assertFalse(self.received()[ids[0]]['locked'])
+
+        refused = self.accept(ids[3])
+        self.assertEqual(refused.status_code, 402)
+        self.assertEqual(refused.data['code'], 'subscription_required')
+        # Declining is always allowed.
+        self.client.force_authenticate(self.provider)
+        self.assertEqual(self.client.patch(f'/app/bookings/{ids[3]}/status/', {'status': 'declined'}).status_code, 200)
+
+    def test_subscribing_unlocks_and_expiry_relocks(self):
+        from datetime import timedelta
+        from django.utils import timezone
+
+        ids = [self.request_booking(c) for c in self.clients[:4]]
+        for booking_id in ids[:3]:
+            self.accept(booking_id)
+        self.assertEqual(self.accept(ids[3]).status_code, 402)
+
+        Profile.objects.filter(user=self.provider).update(is_subscribed=True)
+        unlocked = self.received()[ids[3]]
+        self.assertFalse(unlocked['locked'])
+        self.assertEqual(unlocked['client_username'], 'Client 3')
+        self.assertEqual(self.accept(ids[3]).status_code, 200)
+
+        # A lapsed subscription keeps the free three and locks the rest again.
+        Profile.objects.filter(user=self.provider).update(subscription_expires=timezone.now() - timedelta(days=1))
+        after = self.received()
+        self.assertEqual([after[i]['locked'] for i in ids], [False, False, False, True])
+
+    def test_users_cannot_subscribe_themselves(self):
+        self.client.force_authenticate(self.provider)
+        self.client.patch('/app/profile/', {'is_subscribed': True})
+        self.assertFalse(Profile.objects.get(user=self.provider).is_subscribed)
+
+        self.assertEqual(self.client.post('/app/subscription/request/').status_code, 200)
+        self.client.post('/app/subscription/request/')
+        self.assertTrue(self.client.get('/app/subscription/').data['requested'])
+        from .models import SubscriptionRequest
+        self.assertEqual(SubscriptionRequest.objects.count(), 1)
+
+    def test_client_sixth_accepted_booking_is_locked(self):
+        heavy = self.clients[0]
+        booking_ids = []
+        # Six different providers each accept one booking from the same client.
+        for n in range(6):
+            provider = make_user(f'pro{n}@example.com', name=f'Pro {n}')
+            Profile.objects.filter(user=provider).update(phone_number=f'0800000000{n}')
+            gig = Gig.objects.create(provider=provider, title=f'Job {n}', description='d', category='design')
+            booking_id = self.request_booking(heavy, gig)
+            self.assertEqual(self.accept(booking_id, as_user=provider).status_code, 200)
+            booking_ids.append(booking_id)
+
+        self.client.force_authenticate(heavy)
+        mine = {b['id']: b for b in self.client.get('/app/bookings/mine/').data}
+        self.assertEqual([mine[i]['locked'] for i in booking_ids], [False] * 5 + [True])
+        self.assertEqual(mine[booking_ids[0]]['provider_phone'], '08000000000')
+        self.assertIsNone(mine[booking_ids[5]]['provider_phone'])
+
+        self.assertEqual(self.client.post('/app/conversations/start/', {'booking_id': booking_ids[5]}).status_code, 402)
+        self.assertIn(self.client.post('/app/conversations/start/', {'booking_id': booking_ids[0]}).status_code, (200, 201))
+        self.assertEqual(self.client.get('/app/subscription/').data['client'], {'free_limit': 5, 'used': 5, 'remaining': 0})
+
+    def test_limits_are_settings(self):
+        from .models import AppSettings
+        config = AppSettings.load()
+        config.free_provider_bookings = 1
+        config.save()
+
+        ids = [self.request_booking(c) for c in self.clients[:2]]
+        self.assertEqual(self.accept(ids[0]).status_code, 200)
+        self.assertEqual(self.accept(ids[1]).status_code, 402)
+        self.assertEqual(AppSettings.objects.count(), 1)

@@ -31,4 +31,6 @@ urlpatterns = [
     path('reports/', views.ReportCreateView.as_view(), name='report-create'),
     path('blocks/', views.BlockListCreateView.as_view(), name='block-list-create'),
     path('blocks/<int:user_id>/', views.BlockDeleteView.as_view(), name='block-delete'),
+    path('subscription/', views.SubscriptionView.as_view(), name='subscription'),
+    path('subscription/request/', views.SubscriptionRequestView.as_view(), name='subscription-request'),
 ]

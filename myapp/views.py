@@ -18,8 +18,9 @@ from rest_framework.permissions import (
 from rest_framework.exceptions import ValidationError, PermissionDenied
 
 from .models import (
-    Block, Booking, Conversation, Gig, MAX_GIGS_PER_PROVIDER, Message,
-    PasswordResetCode, PortfolioImage, Profile, Report, Review, public_name,
+    AppSettings, Block, Booking, Conversation, Gig, MAX_GIGS_PER_PROVIDER, Message,
+    PasswordResetCode, PortfolioImage, Profile, Report, Review, SubscriptionRequest,
+    public_name,
 )
 from .serializers import (
     RegisterSerializer,
@@ -36,8 +37,14 @@ from .serializers import (
     check_password_strength,
 )
 from .push_notifications import send_push_notification, send_sms
+from .subscriptions import LockState
 
 User = get_user_model()
+
+SUBSCRIPTION_REQUIRED = {
+    'detail': 'You have used your free bookings. Subscribe to unlock this one.',
+    'code': 'subscription_required',
+}
 
 RESET_CODE_LIFETIME = timedelta(minutes=15)
 RESET_CODE_COOLDOWN = timedelta(seconds=60)
@@ -291,6 +298,10 @@ class BookingStatusUpdateView(generics.UpdateAPIView):
         if new_status == 'cancelled' and request.user != booking.client:
             return Response({'detail': 'Only the client can cancel.'}, status=403)
 
+        # Out of free bookings: the provider must subscribe to accept more.
+        if new_status == 'accepted' and LockState(request.user).is_locked(booking):
+            return Response(SUBSCRIPTION_REQUIRED, status=402)
+
         booking.status = new_status
         booking.save()
 
@@ -458,6 +469,9 @@ class ConversationStartView(generics.GenericAPIView):
         if is_blocked_between(booking.client, booking.provider):
             return Response({'detail': "You can't message this person."}, status=403)
 
+        if LockState(request.user).is_locked(booking):
+            return Response(SUBSCRIPTION_REQUIRED, status=402)
+
         conversation, created = Conversation.objects.get_or_create(
             booking=booking,
             defaults={'client': booking.client, 'provider': booking.provider},
@@ -475,6 +489,8 @@ class MessageListCreateView(generics.ListCreateAPIView):
         conversation = get_object_or_404(Conversation, pk=self.kwargs['pk'])
         if self.request.user not in [conversation.client, conversation.provider]:
             raise PermissionDenied("You are not part of this conversation.")
+        if conversation.booking and LockState(self.request.user).is_locked(conversation.booking):
+            raise PermissionDenied(SUBSCRIPTION_REQUIRED['detail'])
         return conversation
 
     def get_queryset(self):
@@ -653,3 +669,35 @@ class BlockDeleteView(generics.GenericAPIView):
     def delete(self, request, user_id):
         Block.objects.filter(blocker=request.user, blocked_id=user_id).delete()
         return Response(status=204)
+
+
+# ---------------------------------------------------------------------------
+# Subscription
+# ---------------------------------------------------------------------------
+
+class SubscriptionView(generics.GenericAPIView):
+    """Where the signed-in user stands: subscribed or not, and how many free
+    bookings they have left as a provider and as a client."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data = LockState(request.user).summary()
+        try:
+            data['expires'] = request.user.profile.subscription_expires
+        except Profile.DoesNotExist:
+            data['expires'] = None
+        data['price_text'] = AppSettings.load().subscription_price_text
+        data['requested'] = SubscriptionRequest.objects.filter(user=request.user, handled=False).exists()
+        return Response(data)
+
+
+class SubscriptionRequestView(generics.GenericAPIView):
+    """Records that the user wants to subscribe. Online payment is not
+    connected yet, so an admin follows up and switches it on."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        SubscriptionRequest.objects.get_or_create(user=request.user, handled=False)
+        return Response({'detail': "Thanks. We have your request and will be in touch to set up your subscription."})
