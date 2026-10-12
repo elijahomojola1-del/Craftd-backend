@@ -687,10 +687,9 @@ class SubscriptionView(generics.GenericAPIView):
         data['expires'] = (
             Profile.objects.filter(user=request.user).values_list('subscription_expires', flat=True).first()
         )
-        data['price_text'] = payments.price_text()
         # False until a Paystack key and a price are set; the app then falls
         # back to "request a subscription".
-        data['payment_available'] = payments.payment_available()
+        data['payment_available'] = payments.payment_available(request.user)
         data['requested'] = SubscriptionRequest.objects.filter(user=request.user, handled=False).exists()
         return Response(data)
 

@@ -6,6 +6,9 @@ the result twice over: the user's browser returns with a reference that we
 verify, and Paystack's server calls our webhook. Either one switches the
 subscription on; doing both is harmless because a payment is only ever
 applied once.
+
+The amount charged is always worked out here from the user's plan. The app
+never sends a price.
 """
 import hashlib
 import hmac
@@ -17,7 +20,8 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from .models import AppSettings, Payment, Profile, SubscriptionRequest
+from .models import AppSettings, Payment, Profile, SubscriptionRequest, TIER_RANK
+from .subscriptions import required_tier
 
 PAYSTACK_API = 'https://api.paystack.co'
 
@@ -30,17 +34,12 @@ def secret_key():
     return getattr(settings, 'PAYSTACK_SECRET_KEY', '') or ''
 
 
-def payment_available():
-    return bool(secret_key()) and AppSettings.load().subscription_price_naira > 0
-
-
-def price_text(config=None):
-    config = config or AppSettings.load()
-    if config.subscription_price_text:
-        return config.subscription_price_text
-    if config.subscription_price_naira > 0:
-        return f'₦{config.subscription_price_naira:,} for {config.subscription_days} days'
-    return ''
+def payment_available(user):
+    """Online payment needs a Paystack key and a price for this user's plan."""
+    if not secret_key():
+        return False
+    config = AppSettings.load()
+    return config.price_for(required_tier(user, config)) > 0
 
 
 def _paystack(method, path, **kwargs):
@@ -63,17 +62,19 @@ def _paystack(method, path, **kwargs):
 
 def start_payment(user):
     """Create a pending payment and return Paystack's checkout address."""
-    if not payment_available():
+    if not payment_available(user):
         raise PaymentError('Online payment is not available yet.')
     if not user.email:
         raise PaymentError('Your account has no email address to send a receipt to.')
 
     config = AppSettings.load()
+    tier = required_tier(user, config)
     payment = Payment.objects.create(
         user=user,
         reference=f'craftd-{user.id}-{secrets.token_hex(8)}',
-        amount_kobo=config.subscription_price_naira * 100,
+        amount_kobo=config.price_for(tier) * 100,
         days=config.subscription_days,
+        tier=tier,
     )
 
     callback = getattr(settings, 'FRONTEND_URL', '').rstrip('/')
@@ -83,7 +84,7 @@ def start_payment(user):
         'currency': 'NGN',
         'reference': payment.reference,
         'callback_url': f'{callback}/subscribe' if callback else None,
-        'metadata': {'user_id': user.id, 'purpose': 'subscription'},
+        'metadata': {'user_id': user.id, 'purpose': 'subscription', 'plan': tier},
     })
     return {'authorization_url': data['authorization_url'], 'reference': payment.reference}
 
@@ -106,11 +107,25 @@ def apply_payment(reference, paid_amount_kobo, currency='NGN'):
 
         now = timezone.now()
         profile, _ = Profile.objects.select_for_update().get_or_create(user=payment.user)
-        still_running = profile.is_subscribed and profile.subscription_expires and profile.subscription_expires > now
-        start = profile.subscription_expires if still_running else now
+        still_running = bool(
+            profile.is_subscribed and profile.subscription_expires and profile.subscription_expires > now
+        )
+
+        # Renewing the same plan (or a cheaper one) adds time to the end.
+        # Moving up to a dearer plan starts a fresh period on that plan, so
+        # leftover days on the cheaper one are not carried at the higher level.
+        current_rank = TIER_RANK.get(profile.subscription_tier, -1) if still_running else -1
+        if still_running and TIER_RANK[payment.tier] <= current_rank:
+            start = profile.subscription_expires
+            tier = profile.subscription_tier
+        else:
+            start = now
+            tier = payment.tier
+
         profile.is_subscribed = True
         profile.subscription_expires = start + timedelta(days=payment.days)
-        profile.save(update_fields=['is_subscribed', 'subscription_expires'])
+        profile.subscription_tier = tier
+        profile.save(update_fields=['is_subscribed', 'subscription_expires', 'subscription_tier'])
 
         payment.status = 'success'
         payment.paid_at = now

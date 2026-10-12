@@ -8,24 +8,65 @@ unlocks is the booking itself:
 * A client's first few accepted bookings are free. After that, an accepted
   booking stays locked (no contact details or chat) until they subscribe.
 
-The two allowances live in AppSettings and can be changed in the admin.
+What a subscription costs depends on the plan the user needs:
+
+* premium  - a provider with any skill in a premium category
+* standard - any other provider
+* client   - someone who only books and offers no skills
+
+The allowances, prices and premium categories live in AppSettings and can
+be changed in the admin.
 """
 from django.utils import timezone
 
-from .models import AppSettings, Booking, Profile
+from .models import AppSettings, Booking, Gig, Profile, TIER_RANK
 
 # A booking in one of these states has used one of its owner's free slots.
 OPEN_STATUSES = ['accepted', 'completed']
 
+TIER_LABELS = {'client': 'Client', 'standard': 'Standard', 'premium': 'Premium'}
 
-def has_subscription(user):
+
+def required_tier(user, config=None):
+    """The plan this user needs, judged by their most valuable skill."""
+    config = config or AppSettings.load()
+    categories = set(Gig.objects.filter(provider=user).values_list('category', flat=True))
+    if categories:
+        return 'premium' if categories & config.premium_category_set() else 'standard'
+
+    role = Profile.objects.filter(user=user).values_list('role', flat=True).first()
+    return 'client' if role == 'client' else 'standard'
+
+
+def paid_tier(user):
+    """The plan of the user's running subscription: a tier name, '' when an
+    admin granted it (covers everything), or None when there is none."""
     # Read straight from the database rather than a profile object that may
-    # have been loaded before an admin switched the subscription on.
-    row = Profile.objects.filter(user=user).values('is_subscribed', 'subscription_expires').first()
+    # have been loaded before the subscription changed.
+    row = Profile.objects.filter(user=user).values(
+        'is_subscribed', 'subscription_expires', 'subscription_tier'
+    ).first()
     if not row or not row['is_subscribed']:
-        return False
+        return None
     expires = row['subscription_expires']
-    return expires is None or expires > timezone.now()
+    if expires is not None and expires <= timezone.now():
+        return None
+    return row['subscription_tier']
+
+
+def covers(paid, needed):
+    if paid is None:
+        return False
+    if paid == '':
+        return True
+    return TIER_RANK[paid] >= TIER_RANK[needed]
+
+
+def has_subscription(user, config=None):
+    """True when the user's subscription is running AND covers the plan they
+    need now. A Standard subscriber who adds a Construction skill has to
+    upgrade before it counts again."""
+    return covers(paid_tier(user), required_tier(user, config))
 
 
 class LockState:
@@ -34,11 +75,13 @@ class LockState:
 
     def __init__(self, user):
         self.user = user
-        self.subscribed = has_subscription(user)
-        config = AppSettings.load()
+        self.config = AppSettings.load()
+        self.required = required_tier(user, self.config)
+        self.paid = paid_tier(user)
+        self.subscribed = covers(self.paid, self.required)
         self.limits = {
-            'provider': config.free_provider_bookings,
-            'client': config.free_client_bookings,
+            'provider': self.config.free_provider_bookings,
+            'client': self.config.free_client_bookings,
         }
         self._open_ids = {}
 
@@ -81,8 +124,21 @@ class LockState:
         return False
 
     def summary(self):
+        price = self.config.price_for(self.required)
+        days = self.config.subscription_days
         return {
             'is_subscribed': self.subscribed,
+            # The plan this user would buy, and what it costs them.
+            'plan': {
+                'tier': self.required,
+                'label': TIER_LABELS[self.required],
+                'price_naira': price,
+                'days': days,
+            },
+            'price_text': f'₦{price:,} for {days} days' if price > 0 else '',
+            # Paid for a cheaper plan than their skills now need.
+            'needs_upgrade': self.paid not in (None, '') and not self.subscribed,
+            'current_tier_label': TIER_LABELS.get(self.paid, ''),
             'provider': {
                 'free_limit': self.limits['provider'],
                 'used': self.used('provider'),

@@ -35,6 +35,14 @@ ROLE_CHOICES = [
 
 MAX_GIGS_PER_PROVIDER = 3
 
+# Subscription plans, cheapest first. A higher plan covers the ones below it.
+TIER_CHOICES = [
+    ('client', 'Client'),
+    ('standard', 'Standard'),
+    ('premium', 'Premium'),
+]
+TIER_RANK = {'client': 0, 'standard': 1, 'premium': 2}
+
 
 class Gig(models.Model):
     provider = models.ForeignKey(
@@ -67,6 +75,9 @@ class Profile(models.Model):
     # expiry date means the subscription does not run out.
     is_subscribed = models.BooleanField(default=False)
     subscription_expires = models.DateTimeField(blank=True, null=True)
+    # Which plan was paid for. Empty means an admin granted it, which covers
+    # every plan.
+    subscription_tier = models.CharField(max_length=10, choices=TIER_CHOICES, blank=True)
     bio = models.TextField(max_length=500, blank=True)
     location = models.CharField(max_length=120, blank=True)
     phone_number = models.CharField(max_length=20, blank=True)
@@ -259,18 +270,40 @@ class AppSettings(models.Model):
         default=5,
         help_text="How many accepted bookings a client can open before needing a subscription.",
     )
-    subscription_price_naira = models.PositiveIntegerField(
-        default=0,
-        help_text="What one subscription period costs, in naira. Online payment stays off while this is 0.",
+    standard_price_naira = models.PositiveIntegerField(
+        default=5000,
+        help_text="Subscription price, in naira, for providers whose skills are all in standard categories.",
+    )
+    premium_price_naira = models.PositiveIntegerField(
+        default=15000,
+        help_text="Subscription price, in naira, for providers with a skill in a premium category.",
+    )
+    client_price_naira = models.PositiveIntegerField(
+        default=2000,
+        help_text="Subscription price, in naira, for people who only book and offer no skills.",
+    )
+    premium_categories = models.CharField(
+        max_length=300,
+        default='construction,automotive,home_repairs,events,development',
+        help_text=(
+            "Categories charged the premium price, separated by commas. Use the category codes: "
+            + ", ".join(code for code, _ in CATEGORY_CHOICES)
+        ),
     )
     subscription_days = models.PositiveIntegerField(
         default=30,
         help_text="How many days one payment buys.",
     )
-    subscription_price_text = models.CharField(
-        max_length=80, blank=True,
-        help_text='Optional wording for the Subscribe screen. Leave empty to show the price and days above.',
-    )
+
+    def premium_category_set(self):
+        return {code.strip() for code in self.premium_categories.split(',') if code.strip()}
+
+    def price_for(self, tier):
+        return {
+            'client': self.client_price_naira,
+            'standard': self.standard_price_naira,
+            'premium': self.premium_price_naira,
+        }[tier]
 
     class Meta:
         verbose_name = "App settings"
@@ -321,6 +354,7 @@ class Payment(models.Model):
     reference = models.CharField(max_length=64, unique=True)
     amount_kobo = models.PositiveIntegerField()
     days = models.PositiveIntegerField()
+    tier = models.CharField(max_length=10, choices=TIER_CHOICES, default='standard')
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
     created_at = models.DateTimeField(auto_now_add=True)
     paid_at = models.DateTimeField(blank=True, null=True)

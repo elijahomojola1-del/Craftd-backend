@@ -14,7 +14,7 @@ admin.site.register(Block)
 @admin.register(Profile)
 class ProfileAdmin(admin.ModelAdmin):
     # Tick "is subscribed" here to switch a subscription on or off.
-    list_display = ('user', 'display_name', 'role', 'is_subscribed', 'subscription_expires', 'is_verified')
+    list_display = ('user', 'display_name', 'role', 'is_subscribed', 'subscription_tier', 'subscription_expires', 'is_verified')
     list_filter = ('is_subscribed', 'role', 'is_verified')
     list_editable = ('is_subscribed', 'is_verified')
     search_fields = ('user__username', 'user__email', 'display_name')
@@ -37,7 +37,10 @@ class SubscriptionRequestAdmin(admin.ModelAdmin):
 
 @admin.register(AppSettings)
 class AppSettingsAdmin(admin.ModelAdmin):
-    list_display = ('__str__', 'free_provider_bookings', 'free_client_bookings', 'subscription_price_naira', 'subscription_days')
+    list_display = (
+        '__str__', 'free_provider_bookings', 'free_client_bookings',
+        'standard_price_naira', 'premium_price_naira', 'client_price_naira', 'subscription_days',
+    )
 
     def has_add_permission(self, request):
         # There is only ever one row of settings.
@@ -49,7 +52,7 @@ class AppSettingsAdmin(admin.ModelAdmin):
 
 @admin.register(Payment)
 class PaymentAdmin(admin.ModelAdmin):
-    list_display = ('user', 'reference', 'amount_kobo', 'days', 'status', 'created_at', 'paid_at')
+    list_display = ('user', 'reference', 'tier', 'amount_kobo', 'days', 'status', 'created_at', 'paid_at')
     list_filter = ('status',)
     search_fields = ('user__username', 'user__email', 'reference')
-    readonly_fields = ('user', 'reference', 'amount_kobo', 'days', 'status', 'created_at', 'paid_at')
+    readonly_fields = ('user', 'reference', 'tier', 'amount_kobo', 'days', 'status', 'created_at', 'paid_at')

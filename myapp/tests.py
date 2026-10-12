@@ -368,7 +368,7 @@ class PaymentTests(APITestCase):
 
         self.user = make_user('payer@example.com', name='Payer')
         config = AppSettings.load()
-        config.subscription_price_naira = 2000
+        config.standard_price_naira = 2000
         config.subscription_days = 30
         config.save()
 
@@ -402,6 +402,7 @@ class PaymentTests(APITestCase):
         self.assertEqual(self.paystack.call_args.kwargs['headers']['Authorization'], 'Bearer sk_test_fake')
         self.assertEqual(Payment.objects.get().reference, reference)
         self.assertEqual(self.client.get('/app/subscription/').data['price_text'], '\u20a62,000 for 30 days')
+        self.assertEqual(Payment.objects.get().tier, 'standard')
 
     def test_verify_switches_subscription_on_once(self):
         from datetime import timedelta
@@ -463,3 +464,65 @@ class PaymentTests(APITestCase):
             self.client.force_authenticate(self.user)
             self.assertFalse(self.client.get('/app/subscription/').data['payment_available'])
             self.assertEqual(self.client.post('/app/subscription/pay/').status_code, 503)
+
+    def test_price_follows_the_users_plan(self):
+        from .models import AppSettings, Payment
+        config = AppSettings.load()
+        config.standard_price_naira, config.premium_price_naira, config.client_price_naira = 5000, 15000, 2000
+        config.save()
+
+        def plan(user):
+            self.client.force_authenticate(user)
+            data = self.client.get('/app/subscription/').data
+            return data['plan']['tier'], data['plan']['price_naira'], data['price_text']
+
+        client = make_user('booker@example.com', role='client')
+        self.assertEqual(plan(client), ('client', 2000, '\u20a62,000 for 30 days'))
+
+        # A provider with no skills yet, then a standard skill, then a premium one.
+        self.assertEqual(plan(self.user)[:2], ('standard', 5000))
+        Gig.objects.create(provider=self.user, title='Braids', description='d', category='beauty_fashion')
+        self.assertEqual(plan(self.user)[:2], ('standard', 5000))
+        Gig.objects.create(provider=self.user, title='Roofing', description='d', category='construction')
+        self.assertEqual(plan(self.user), ('premium', 15000, '\u20a615,000 for 30 days'))
+
+        # The amount charged comes from the plan, whatever the app sends.
+        self.reply({'authorization_url': 'https://checkout.paystack.com/abc'})
+        self.client.post('/app/subscription/pay/', {'amount': 1})
+        self.assertEqual(self.paystack.call_args.kwargs['json']['amount'], 1500000)
+        self.assertEqual(Payment.objects.latest('created_at').tier, 'premium')
+
+        # Premium categories are a setting.
+        config.premium_categories = 'automotive'
+        config.save()
+        self.assertEqual(plan(self.user)[:2], ('standard', 5000))
+
+    def test_standard_subscriber_must_upgrade_for_a_premium_skill(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        Gig.objects.create(provider=self.user, title='Braids', description='d', category='beauty_fashion')
+        reference = self.start()
+        self.reply({'status': 'success', 'amount': 200000, 'currency': 'NGN'})
+        self.client.post('/app/subscription/verify/', {'reference': reference})
+        data = self.client.get('/app/subscription/').data
+        self.assertEqual((data['is_subscribed'], data['needs_upgrade'], data['current_tier_label']), (True, False, 'Standard'))
+
+        Gig.objects.create(provider=self.user, title='Roofing', description='d', category='construction')
+        data = self.client.get('/app/subscription/').data
+        self.assertEqual((data['is_subscribed'], data['needs_upgrade'], data['plan']['tier']), (False, True, 'premium'))
+
+        # Paying for Premium starts a fresh 30 days on the higher plan.
+        reference = self.start()
+        self.reply({'status': 'success', 'amount': 1500000, 'currency': 'NGN'})
+        self.client.post('/app/subscription/verify/', {'reference': reference})
+        profile = Profile.objects.get(user=self.user)
+        self.assertEqual(profile.subscription_tier, 'premium')
+        self.assertAlmostEqual(profile.subscription_expires, timezone.now() + timedelta(days=30), delta=timedelta(minutes=1))
+        self.assertTrue(self.client.get('/app/subscription/').data['is_subscribed'])
+
+    def test_admin_granted_subscription_covers_every_plan(self):
+        Gig.objects.create(provider=self.user, title='Roofing', description='d', category='construction')
+        Profile.objects.filter(user=self.user).update(is_subscribed=True)
+        self.client.force_authenticate(self.user)
+        data = self.client.get('/app/subscription/').data
+        self.assertEqual((data['is_subscribed'], data['needs_upgrade']), (True, False))

@@ -103,7 +103,7 @@ class ProfileSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
         # Users can't verify or subscribe themselves by editing their profile.
-        read_only_fields = ['is_verified', 'is_subscribed', 'subscription_expires']
+        read_only_fields = ['is_verified', 'is_subscribed', 'subscription_expires']  # subscription_tier is not exposed at all
 
     def get_gig_count(self, obj):
         return obj.user.gigs.count()
