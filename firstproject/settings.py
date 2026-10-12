@@ -48,8 +48,14 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://craftd-1.expo.app").strip
 
 # Railway sets these automatically. Their presence is a reliable signal that
 # this is the deployed environment rather than a laptop.
-RAILWAY_HOST = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
-IS_RAILWAY = bool(RAILWAY_HOST or os.environ.get("RAILWAY_ENVIRONMENT"))
+#
+# Render is detected the same way (it sets RENDER and RENDER_EXTERNAL_HOSTNAME)
+# and shares these two names, so everything below that says "Railway" applies
+# to whichever host the app is deployed on.
+RAILWAY_HOST = os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+IS_RAILWAY = bool(
+    RAILWAY_HOST or os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RENDER")
+)
 
 # An explicit DEBUG env var always wins. Otherwise: off on Railway, on
 # locally. Note that because IS_RAILWAY already forces False in production,
@@ -83,12 +89,12 @@ if DEBUG:
 else:
     # Never leave this empty: runserver refuses to start on an empty list
     # when DEBUG is False.
-    ALLOWED_HOSTS = [".railway.app", "localhost", "127.0.0.1"]
+    ALLOWED_HOSTS = [".railway.app", ".onrender.com", "localhost", "127.0.0.1"]
     if RAILWAY_HOST:
         ALLOWED_HOSTS.append(RAILWAY_HOST)
 
 # Required for the Django admin to accept POSTs over HTTPS on Railway.
-CSRF_TRUSTED_ORIGINS = ["https://*.railway.app"]
+CSRF_TRUSTED_ORIGINS = ["https://*.railway.app", "https://*.onrender.com"]
 if RAILWAY_HOST:
     CSRF_TRUSTED_ORIGINS.append(f"https://{RAILWAY_HOST}")
 
@@ -235,7 +241,12 @@ WSGI_APPLICATION = "firstproject.wsgi.application"
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 if DATABASE_URL:
-    IS_INTERNAL_DB = ".railway.internal" in DATABASE_URL
+    # Private-network database addresses don't use TLS: Railway's end in
+    # .railway.internal, and Render's internal host is a bare name with no dots.
+    _db_host = dj_database_url.parse(DATABASE_URL).get("HOST") or ""
+    IS_INTERNAL_DB = ".railway.internal" in DATABASE_URL or (
+        bool(_db_host) and "." not in _db_host
+    )
     DATABASES = {
         "default": dj_database_url.config(
             default=DATABASE_URL,
