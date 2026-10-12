@@ -33,6 +33,5 @@ services:
         sync: false
       - key: CLOUDINARY_API_SECRET
         sync: false
-      # Leave empty until Paystack is ready; payments stay off without it.
-      - key: PAYSTACK_SECRET_KEY
-        sync: false
+      # PAYSTACK_SECRET_KEY is added by hand in the Render dashboard when
+      # payments are ready; they stay off until it exists.
