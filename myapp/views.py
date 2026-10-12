@@ -1,14 +1,26 @@
+import secrets
+from datetime import timedelta
+
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import check_password, make_password
+from django.core.mail import send_mail
 from django.db.models import F, ExpressionWrapper, FloatField, Avg, Q
 from django.db.models.functions import Radians, Sin, Cos, ATan2, Sqrt
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 
 from rest_framework import generics
 from rest_framework.response import Response
-from rest_framework.permissions import AllowAny, IsAuthenticatedOrReadOnly, IsAuthenticated
+from rest_framework.permissions import (
+    AllowAny, BasePermission, IsAuthenticated, IsAuthenticatedOrReadOnly, SAFE_METHODS,
+)
 from rest_framework.exceptions import ValidationError, PermissionDenied
 
-from .models import Gig, Profile, PortfolioImage, Booking, Review, Conversation, Message
+from .models import (
+    Block, Booking, Conversation, Gig, MAX_GIGS_PER_PROVIDER, Message,
+    PasswordResetCode, PortfolioImage, Profile, Report, Review, public_name,
+)
 from .serializers import (
     RegisterSerializer,
     GigSerializer,
@@ -19,10 +31,43 @@ from .serializers import (
     NearbyProviderSerializer,
     ConversationSerializer,
     MessageSerializer,
+    ReportSerializer,
+    BlockSerializer,
+    check_password_strength,
 )
 from .push_notifications import send_push_notification, send_sms
 
 User = get_user_model()
+
+RESET_CODE_LIFETIME = timedelta(minutes=15)
+RESET_CODE_COOLDOWN = timedelta(seconds=60)
+RESET_CODE_MAX_ATTEMPTS = 5
+
+
+def blocked_user_ids(user):
+    """Ids of everyone this user has blocked or been blocked by."""
+    if not user or not user.is_authenticated:
+        return set()
+    pairs = Block.objects.filter(Q(blocker=user) | Q(blocked=user)).values_list('blocker_id', 'blocked_id')
+    ids = set()
+    for blocker_id, blocked_id in pairs:
+        ids.add(blocked_id if blocker_id == user.id else blocker_id)
+    return ids
+
+
+def is_blocked_between(user, other):
+    return Block.objects.filter(
+        Q(blocker=user, blocked=other) | Q(blocker=other, blocked=user)
+    ).exists()
+
+
+class IsProviderOrReadOnly(BasePermission):
+    """Anyone may read a gig; only the provider who owns it may change it."""
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in SAFE_METHODS:
+            return True
+        return request.user.is_authenticated and obj.provider_id == request.user.id
 
 
 class RegisterView(generics.CreateAPIView):
@@ -36,18 +81,46 @@ class GigListCreateView(generics.ListCreateAPIView):
     permission_classes = [IsAuthenticatedOrReadOnly]
 
     def get_queryset(self):
-        if self.request.query_params.get('mine') == 'true':
+        params = self.request.query_params
+
+        if params.get('mine') == 'true':
+            if not self.request.user.is_authenticated:
+                return Gig.objects.none()
             return Gig.objects.filter(provider=self.request.user).order_by('-created_at')
-        return Gig.objects.filter(is_active=True).order_by('-created_at')
+
+        queryset = Gig.objects.filter(is_active=True)
+
+        hidden = blocked_user_ids(self.request.user)
+        if hidden:
+            queryset = queryset.exclude(provider_id__in=hidden)
+
+        category = params.get('category')
+        if category:
+            queryset = queryset.filter(category=category)
+
+        search = (params.get('search') or '').strip()
+        if search:
+            queryset = queryset.filter(
+                Q(title__icontains=search)
+                | Q(description__icontains=search)
+                | Q(location__icontains=search)
+                | Q(category__icontains=search.replace(' ', '_'))
+            )
+
+        return queryset.order_by('-created_at')
 
     def perform_create(self, serializer):
+        if Gig.objects.filter(provider=self.request.user).count() >= MAX_GIGS_PER_PROVIDER:
+            raise ValidationError(
+                f"You can only have {MAX_GIGS_PER_PROVIDER} skills at a time. Remove one before adding another."
+            )
         serializer.save(provider=self.request.user)
 
 
 class GigDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Gig.objects.all()
     serializer_class = GigSerializer
-    permission_classes = [IsAuthenticatedOrReadOnly]
+    permission_classes = [IsAuthenticatedOrReadOnly, IsProviderOrReadOnly]
 
 
 class NearbyProvidersView(generics.ListAPIView):
@@ -62,9 +135,12 @@ class NearbyProvidersView(generics.ListAPIView):
         if not lat or not lng:
             raise ValidationError("lat and lng query params are required.")
 
-        lat = float(lat)
-        lng = float(lng)
-        radius_km = float(radius_km)
+        try:
+            lat = float(lat)
+            lng = float(lng)
+            radius_km = float(radius_km)
+        except ValueError:
+            raise ValidationError("lat, lng and radius must be numbers.")
 
         queryset = Profile.objects.exclude(
             latitude__isnull=True
@@ -72,9 +148,14 @@ class NearbyProvidersView(generics.ListAPIView):
             longitude__isnull=True
         ).exclude(
             user=self.request.user
-        ).annotate(
+        ).exclude(
+            user_id__in=blocked_user_ids(self.request.user)
+        ).filter(
+            # Only people who actually offer a service are "providers".
+            user__gigs__is_active=True
+        ).distinct().annotate(
             distance_km=ExpressionWrapper(
-                6371 * ATan2(
+                6371 * 2 * ATan2(
                     Sqrt(
                         Sin(Radians(F('latitude') - lat) / 2) ** 2 +
                         Cos(Radians(lat)) * Cos(Radians(F('latitude'))) *
@@ -143,7 +224,14 @@ class BookingCreateView(generics.CreateAPIView):
 
     def perform_create(self, serializer):
         gig = serializer.validated_data['gig']
+
+        if gig.provider_id == self.request.user.id:
+            raise ValidationError("You can't book your own skill.")
+        if is_blocked_between(self.request.user, gig.provider):
+            raise PermissionDenied("You can't book this provider.")
+
         booking = serializer.save(client=self.request.user, provider=gig.provider)
+        client_name = public_name(self.request.user)
 
         try:
             provider_profile = Profile.objects.get(user=gig.provider)
@@ -152,14 +240,14 @@ class BookingCreateView(generics.CreateAPIView):
                 send_push_notification(
                     push_token=provider_profile.push_token,
                     title='New Booking Request',
-                    body=f'{self.request.user.username} wants to book "{gig.title}"',
+                    body=f'{client_name} wants to book "{gig.title}"',
                     data={'booking_id': booking.id, 'type': 'new_booking'},
                 )
 
             if provider_profile.phone_number:
                 send_sms(
                     phone_number=provider_profile.phone_number,
-                    message=f'CRAFTD: {self.request.user.username} wants to book "{gig.title}". Open the app to respond.',
+                    message=f'CRAFTD: {client_name} wants to book "{gig.title}". Open the app to respond.',
                 )
         except Profile.DoesNotExist:
             pass
@@ -280,7 +368,7 @@ class ProviderReviewListView(generics.ListAPIView):
     serializer_class = ReviewSerializer
 
     def get_queryset(self):
-        provider_id = self.kwargs['pk']
+        provider_id = self.kwargs.get('pk') or self.kwargs.get('user_id')
         return Review.objects.filter(reviewee_id=provider_id).order_by('-created_at')
 
 
@@ -290,13 +378,17 @@ class ProviderDetailView(generics.RetrieveAPIView):
     def get(self, request, pk):
         provider = get_object_or_404(User, pk=pk)
         profile = get_object_or_404(Profile, user=provider)
+
+        if Block.objects.filter(blocker=provider, blocked=request.user).exists():
+            return Response({'detail': 'This profile is not available.'}, status=404)
+
         gigs = provider.gigs.filter(is_active=True)
         reviews = Review.objects.filter(reviewee=provider)
         avg_rating = reviews.aggregate(avg=Avg('rating'))['avg'] or 0
 
         data = {
             'id': provider.id,
-            'username': provider.username,
+            'username': public_name(provider),
             'bio': profile.bio,
             'location': profile.location,
             'city': profile.city,
@@ -305,6 +397,8 @@ class ProviderDetailView(generics.RetrieveAPIView):
             'is_verified': profile.is_verified,
             'average_rating': round(avg_rating, 1),
             'total_reviews': reviews.count(),
+            'is_blocked': Block.objects.filter(blocker=request.user, blocked=provider).exists(),
+            'is_me': provider.id == request.user.id,
             'gigs': GigSerializer(gigs, many=True, context={'request': request}).data,
             'portfolio': PortfolioImageSerializer(provider.portfolio_images.all(), many=True, context={'request': request}).data,
         }
@@ -331,9 +425,12 @@ class ConversationListView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
+        hidden = blocked_user_ids(user)
         return Conversation.objects.filter(
             Q(client=user) | Q(provider=user)
-        ).order_by('-updated_at')  # ← most recent first
+        ).exclude(
+            Q(client_id__in=hidden) | Q(provider_id__in=hidden)
+        ).order_by('-updated_at')
 
     def get_serializer_context(self):
         return {'request': self.request}
@@ -357,6 +454,9 @@ class ConversationStartView(generics.GenericAPIView):
                 {'detail': 'Messaging is only available once the provider has accepted this booking.'},
                 status=403,
             )
+
+        if is_blocked_between(booking.client, booking.provider):
+            return Response({'detail': "You can't message this person."}, status=403)
 
         conversation, created = Conversation.objects.get_or_create(
             booking=booking,
@@ -392,6 +492,9 @@ class MessageListCreateView(generics.ListCreateAPIView):
         if conversation.booking and conversation.booking.status not in ['accepted', 'completed']:
             raise PermissionDenied("This booking is no longer accepting messages.")
 
+        if is_blocked_between(conversation.client, conversation.provider):
+            raise PermissionDenied("You can't message this person.")
+
         message = serializer.save(conversation=conversation, sender=self.request.user)
 
         conversation.save()
@@ -403,9 +506,150 @@ class MessageListCreateView(generics.ListCreateAPIView):
             if recipient_profile.push_token:
                 send_push_notification(
                     push_token=recipient_profile.push_token,
-                    title=f'New message from {self.request.user.username}',
+                    title=f'New message from {public_name(self.request.user)}',
                     body=message.content[:100],
                     data={'conversation_id': conversation.id, 'type': 'new_message'},
                 )
         except Profile.DoesNotExist:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Account: passwords and deletion
+# ---------------------------------------------------------------------------
+
+class ChangePasswordView(generics.GenericAPIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        old_password = request.data.get('old_password') or ''
+        new_password = request.data.get('new_password') or ''
+
+        if not request.user.check_password(old_password):
+            return Response({'detail': 'Your current password is incorrect.'}, status=400)
+
+        check_password_strength(new_password, user=request.user)
+        request.user.set_password(new_password)
+        request.user.save()
+        return Response({'detail': 'Your password has been changed.'})
+
+
+class PasswordResetRequestView(generics.GenericAPIView):
+    permission_classes = [AllowAny]
+
+    # The reply is the same whether or not the email belongs to an account,
+    # so this can't be used to find out who is registered.
+    reply = {'detail': 'If that email has an account, we have sent it a 6-digit code.'}
+
+    def post(self, request):
+        email = (request.data.get('email') or '').strip().lower()
+        user = User.objects.filter(email__iexact=email).first() if email else None
+
+        if user:
+            recent = PasswordResetCode.objects.filter(
+                user=user, created_at__gte=timezone.now() - RESET_CODE_COOLDOWN
+            ).exists()
+            if not recent:
+                code = f'{secrets.randbelow(1000000):06d}'
+                PasswordResetCode.objects.filter(user=user, used=False).update(used=True)
+                PasswordResetCode.objects.create(user=user, code_hash=make_password(code))
+                try:
+                    send_mail(
+                        subject='Your CRAFTD password reset code',
+                        message=(
+                            f'Your CRAFTD password reset code is {code}.\n\n'
+                            'It expires in 15 minutes. If you did not ask for this, '
+                            'you can ignore this email and your password will stay the same.'
+                        ),
+                        from_email=getattr(settings, 'DEFAULT_FROM_EMAIL', None),
+                        recipient_list=[user.email],
+                    )
+                except Exception as exc:  # mail server unreachable or misconfigured
+                    print(f'Password reset email failed: {exc}')
+
+        return Response(self.reply)
+
+
+class PasswordResetConfirmView(generics.GenericAPIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = (request.data.get('email') or '').strip().lower()
+        code = (request.data.get('code') or '').strip()
+        new_password = request.data.get('new_password') or ''
+        invalid = Response({'detail': 'That code is wrong or has expired. Request a new one.'}, status=400)
+
+        user = User.objects.filter(email__iexact=email).first() if email else None
+        if not user:
+            return invalid
+
+        reset = PasswordResetCode.objects.filter(
+            user=user, used=False, created_at__gte=timezone.now() - RESET_CODE_LIFETIME
+        ).first()
+        if not reset or reset.attempts >= RESET_CODE_MAX_ATTEMPTS:
+            return invalid
+
+        if not check_password(code, reset.code_hash):
+            reset.attempts += 1
+            reset.save(update_fields=['attempts'])
+            return invalid
+
+        check_password_strength(new_password, user=user)
+        user.set_password(new_password)
+        user.save()
+        reset.used = True
+        reset.save(update_fields=['used'])
+        return Response({'detail': 'Your password has been reset. You can log in now.'})
+
+
+class DeleteAccountView(generics.GenericAPIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if not request.user.check_password(request.data.get('password') or ''):
+            return Response({'detail': 'Your password is incorrect.'}, status=400)
+
+        # Cascades to the profile, gigs, bookings, reviews, messages and photos.
+        request.user.delete()
+        return Response({'detail': 'Your account has been deleted.'})
+
+
+# ---------------------------------------------------------------------------
+# Safety: reports and blocks
+# ---------------------------------------------------------------------------
+
+class ReportCreateView(generics.CreateAPIView):
+    serializer_class = ReportSerializer
+    permission_classes = [IsAuthenticated]
+
+    def perform_create(self, serializer):
+        if serializer.validated_data['reported_user'] == self.request.user:
+            raise ValidationError("You can't report yourself.")
+        serializer.save(reporter=self.request.user)
+
+
+class BlockListCreateView(generics.ListCreateAPIView):
+    serializer_class = BlockSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return Block.objects.filter(blocker=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        blocked = serializer.validated_data['blocked']
+
+        if blocked == request.user:
+            raise ValidationError("You can't block yourself.")
+
+        block, created = Block.objects.get_or_create(blocker=request.user, blocked=blocked)
+        return Response(self.get_serializer(block).data, status=201 if created else 200)
+
+
+class BlockDeleteView(generics.GenericAPIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, user_id):
+        Block.objects.filter(blocker=request.user, blocked_id=user_id).delete()
+        return Response(status=204)

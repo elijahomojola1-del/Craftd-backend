@@ -24,4 +24,11 @@ urlpatterns = [
     path('conversations/', views.ConversationListView.as_view(), name='conversation-list'),
     path('conversations/start/', views.ConversationStartView.as_view(), name='conversation-start'),
     path('conversations/<int:pk>/messages/', views.MessageListCreateView.as_view(), name='conversation-messages'),
+    path('change-password/', views.ChangePasswordView.as_view(), name='change-password'),
+    path('password-reset/', views.PasswordResetRequestView.as_view(), name='password-reset'),
+    path('password-reset/confirm/', views.PasswordResetConfirmView.as_view(), name='password-reset-confirm'),
+    path('delete-account/', views.DeleteAccountView.as_view(), name='delete-account'),
+    path('reports/', views.ReportCreateView.as_view(), name='report-create'),
+    path('blocks/', views.BlockListCreateView.as_view(), name='block-list-create'),
+    path('blocks/<int:user_id>/', views.BlockDeleteView.as_view(), name='block-delete'),
 ]

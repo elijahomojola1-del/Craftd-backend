@@ -28,6 +28,14 @@ BOOKING_STATUS_CHOICES = [
 ]
 
 
+ROLE_CHOICES = [
+    ('client', 'Client'),
+    ('provider', 'Provider'),
+]
+
+MAX_GIGS_PER_PROVIDER = 3
+
+
 class Gig(models.Model):
     provider = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='gigs'
@@ -35,7 +43,8 @@ class Gig(models.Model):
     title = models.CharField(max_length=120)
     description = models.TextField()
     category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default='other')
-    price = models.DecimalField(max_digits=10, decimal_places=2)
+    # Prices are agreed in chat and no longer listed; kept for old records.
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     location = models.CharField(max_length=120, blank=True)
     image = models.ImageField(upload_to='gig_images/', blank=True, null=True)
     is_active = models.BooleanField(default=True)
@@ -51,6 +60,9 @@ class Profile(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='profile'
     )
     push_token = models.CharField(max_length=255, blank=True, null=True)
+    # Shown to other users in place of the account's email address.
+    display_name = models.CharField(max_length=80, blank=True)
+    role = models.CharField(max_length=10, choices=ROLE_CHOICES, default='provider')
     bio = models.TextField(max_length=500, blank=True)
     location = models.CharField(max_length=120, blank=True)
     phone_number = models.CharField(max_length=20, blank=True)
@@ -65,6 +77,15 @@ class Profile(models.Model):
 
     def __str__(self):
         return f"{self.user.username}'s profile"
+
+
+def public_name(user):
+    """The name other users see: the chosen display name, never the full email."""
+    try:
+        name = user.profile.display_name.strip()
+    except Profile.DoesNotExist:
+        name = ''
+    return name or user.username.split('@')[0]
 
 
 class PortfolioImage(models.Model):
@@ -160,3 +181,64 @@ class Message(models.Model):
 
     def __str__(self):
         return f"{self.sender.username}: {self.content[:30]}"
+
+REPORT_REASON_CHOICES = [
+    ('scam', 'Scam or fraud'),
+    ('abuse', 'Abuse or harassment'),
+    ('fake', 'Fake profile or listing'),
+    ('no_show', 'Did not show up'),
+    ('other', 'Something else'),
+]
+
+
+class Report(models.Model):
+    reporter = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='reports_made'
+    )
+    reported_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='reports_received'
+    )
+    reason = models.CharField(max_length=20, choices=REPORT_REASON_CHOICES)
+    details = models.TextField(max_length=1000, blank=True)
+    resolved = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.reporter.username} reported {self.reported_user.username} ({self.reason})"
+
+
+class Block(models.Model):
+    blocker = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='blocks_made'
+    )
+    blocked = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='blocks_received'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        unique_together = ('blocker', 'blocked')
+
+    def __str__(self):
+        return f"{self.blocker.username} blocked {self.blocked.username}"
+
+
+class PasswordResetCode(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='password_reset_codes'
+    )
+    # Only a hash of the emailed code is kept.
+    code_hash = models.CharField(max_length=128)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    used = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Password reset for {self.user.username}"
